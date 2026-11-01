@@ -1,11 +1,16 @@
 import socket
 import argparse
 import logging
+import os
+import struct
+import sys
 import time
 from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
+ICMP_PAYLOAD = b"net-ping"
+
 
 def setup_argparse():
     """
@@ -42,42 +47,70 @@ def setup_argparse():
     )
     return parser
 
-def send_ping(host: str, timeout: int) -> Optional[float]:
+
+def icmp_checksum(data: bytes) -> int:
+    """Computes the Internet checksum over data, per RFC 1071."""
+    if len(data) % 2:
+        data += b'\x00'
+    total = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return (~total) & 0xFFFF
+
+
+def build_echo_request(identifier: int, sequence: int) -> bytes:
+    """Builds an ICMP echo request packet (type 8) with a valid checksum."""
+    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, 0, identifier, sequence)
+    checksum = icmp_checksum(header + ICMP_PAYLOAD)
+    header = struct.pack('!BBHHH', ICMP_ECHO_REQUEST, 0, checksum, identifier, sequence)
+    return header + ICMP_PAYLOAD
+
+
+def parse_echo_reply(packet: bytes, identifier: int, sequence: int) -> bool:
+    """Returns True when packet is an ICMP echo reply matching identifier and sequence."""
+    if not packet:
+        return False
+    ip_header_len = (packet[0] & 0x0F) * 4
+    if ip_header_len < 20 or len(packet) < ip_header_len + 8:
+        return False
+    icmp_packet = packet[ip_header_len:]
+    reply_type, _code, _checksum, reply_id, reply_seq = struct.unpack('!BBHHH', icmp_packet[:8])
+    return reply_type == ICMP_ECHO_REPLY and reply_id == identifier and reply_seq == sequence
+
+
+def send_ping(host: str, timeout: int, sequence: int = 1) -> Optional[float]:
     """
-    Sends a single ICMP echo request to the specified host.
+    Sends a single ICMP echo request to the specified host and times the reply.
 
     Args:
         host (str): The hostname or IP address to ping.
         timeout (int): Timeout in seconds for the request.
+        sequence (int): Sequence number for this echo request.
 
     Returns:
-        Optional[float]: Response time in milliseconds, or None if the request times out.
+        Optional[float]: Response time in milliseconds, or None if no matching
+        echo reply arrives before the timeout.
+
+    Raises:
+        PermissionError: When the process may not open a raw ICMP socket.
     """
-    try:
-        # Resolve the host address
-        target_ip = socket.gethostbyname(host)
-        logging.debug(f'Resolved {host} to {target_ip}')
-        
-        # Create a socket
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(timeout)
-            message = b'ping'
-            start_time = time.time()
-            sock.sendto(message, (target_ip, 1))
-            sock.recvfrom(1024)
-            end_time = time.time()
-        
-        response_time = (end_time - start_time) * 1000  # Convert to milliseconds
-        return response_time
-    except socket.gaierror:
-        logging.error(f'Failed to resolve host: {host}')
-        return None
-    except socket.timeout:
-        logging.warning(f'Ping to {host} timed out.')
-        return None
-    except Exception as e:
-        logging.error(f'An error occurred during ping: {e}')
-        return None
+    target_ip = socket.gethostbyname(host)
+    identifier = os.getpid() & 0xFFFF
+    packet = build_echo_request(identifier, sequence)
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as sock:
+        sock.settimeout(timeout)
+        start_time = time.time()
+        sock.sendto(packet, (target_ip, 0))
+        while True:
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                raise socket.timeout('timed out')
+            sock.settimeout(remaining)
+            data, _addr = sock.recvfrom(2048)
+            if parse_echo_reply(data, identifier, sequence):
+                end_time = time.time()
+                return (end_time - start_time) * 1000
+
 
 def main():
     """
@@ -86,8 +119,10 @@ def main():
     parser = setup_argparse()
     args = parser.parse_args()
 
+    handlers = [logging.StreamHandler()]
     if args.log:
-        logging.basicConfig(filename=args.log, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        handlers.append(logging.FileHandler(args.log))
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=handlers, force=True)
 
     logging.info(f'Starting ping to {args.host} with {args.count} requests and {args.timeout}s timeout.')
 
@@ -96,7 +131,20 @@ def main():
 
     for i in range(args.count):
         logging.info(f'Sending ping {i + 1} to {args.host}...')
-        response_time = send_ping(args.host, args.timeout)
+        try:
+            response_time = send_ping(args.host, args.timeout, sequence=i + 1)
+        except PermissionError:
+            logging.error('net-ping needs raw socket access to send ICMP echo requests: run as root or grant the CAP_NET_RAW capability.')
+            sys.exit(1)
+        except socket.gaierror:
+            logging.error(f'Failed to resolve host: {args.host}')
+            sys.exit(1)
+        except socket.timeout:
+            logging.warning(f'Ping to {args.host} timed out.')
+            response_time = None
+        except Exception as e:
+            logging.error(f'An error occurred during ping: {e}')
+            response_time = None
 
         if response_time is not None:
             logging.info(f'Ping {i + 1}: Response time = {response_time:.2f} ms')
@@ -111,7 +159,9 @@ def main():
         logging.info(f'  Packets: Sent = {args.count}, Received = {successful_pings}, Lost = {args.count - successful_pings}')
         logging.info(f'  Average response time = {average_time:.2f} ms')
     else:
-        logging.info(f'No responses received from {args.host}.')
+        logging.error(f'Ping failed: no responses received from {args.host}.')
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
