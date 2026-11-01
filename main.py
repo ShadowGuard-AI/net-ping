@@ -94,6 +94,10 @@ def send_ping(host: str, timeout: int, sequence: int = 1) -> Optional[float]:
     Raises:
         PermissionError: When the process may not open a raw ICMP socket.
     """
+    # The name is resolved again on every call, so a run of four pings
+    # does four lookups and could in principle hit different addresses
+    # if the name rotates. The identifier stays the pid for all of them;
+    # the sequence number is what tells my replies apart.
     target_ip = socket.gethostbyname(host)
     identifier = os.getpid() & 0xFFFF
     packet = build_echo_request(identifier, sequence)
@@ -101,6 +105,11 @@ def send_ping(host: str, timeout: int, sequence: int = 1) -> Optional[float]:
         sock.settimeout(timeout)
         start_time = time.time()
         sock.sendto(packet, (target_ip, 0))
+        # Packets that are not my reply are dropped and the wait goes
+        # on against the original deadline. I recompute the remaining
+        # time each round instead of giving each recv a fresh timeout,
+        # so unrelated ICMP traffic cannot stretch one ping past the
+        # timeout the user asked for.
         while True:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
@@ -129,6 +138,9 @@ def main():
     successful_pings = 0
     total_time = 0
 
+    # There is no pause between pings. Each one starts as soon as the
+    # previous reply or timeout lands, so a fast host gets the whole
+    # count back to back instead of one per second like system ping.
     for i in range(args.count):
         logging.info(f'Sending ping {i + 1} to {args.host}...')
         try:
